@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-from math import radians, cos, isnan, degrees, hypot
-from typing import Optional, Tuple
+from math import radians, cos, isnan, hypot
+from typing import Optional
+import argparse
+from types import SimpleNamespace
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import NavSatFix
-from geometry_msgs.msg import PointStamped, QuaternionStamped
+from geometry_msgs.msg import PointStamped, Vector3Stamped
 from std_msgs.msg import Float64
-from geometry_msgs.msg import Vector3Stamped
 
 
 class XsensLocalXY(Node):
@@ -65,6 +66,11 @@ class XsensLocalXY(Node):
         self.origin_lon: Optional[float] = None
         self.origin_set = False
 
+        self.current_lat: Optional[float] = None
+        self.current_lon: Optional[float] = None
+        self.current_x_m: float = 0.0
+        self.current_y_m: float = 0.0
+
         self.prev_x_m: Optional[float] = None
         self.prev_y_m: Optional[float] = None
         self.last_heading_deg = 0.0
@@ -100,16 +106,23 @@ class XsensLocalXY(Node):
             self.get_logger().warning('Received NaN lat/lon... skipping fix...')
             return
 
+        self.current_lat = lat
+        self.current_lon = lon
+
         if not self.origin_set:
             self.origin_lat = lat
             self.origin_lon = lon
             self.origin_set = True
-            x_m, y_m = 0.0, 0.0
-            self.prev_x_m, self.prev_y_m = x_m, y_m
+
+            self.current_x_m = 0.0
+            self.current_y_m = 0.0
+            self.prev_x_m = 0.0
+            self.prev_y_m = 0.0
+
             self.get_logger().info(
                 f"Origin set to lat={self.origin_lat:.8f}, lon={self.origin_lon:.8f}"
             )
-            self.publish_xy(msg, x_m, y_m)
+            self.publish_xy(msg, 0.0, 0.0)
             if self.log_every_fix:
                 self.get_logger().info(
                     f"fix lat={lat:.8f}, lon={lon:.8f} -> local x={x_m:.2f} m, y={y_m:.2f} m, "
@@ -118,6 +131,9 @@ class XsensLocalXY(Node):
             return
 
         x_m, y_m = self.latlon_to_local_xy(lat, lon)
+        self.current_x_m = x_m
+        self.current_y_m = y_m
+
         self.publish_points_between(msg, x_m, y_m)
 
         if self.log_every_fix:
@@ -177,6 +193,7 @@ class XsensLocalXY(Node):
 
         step = max(self.point_spacing_m, 1e-3)
         num_steps = int(distance // step)
+        xi, yi = self.prev_x_m, self.prev_y_m
 
         for i in range(1, num_steps + 1):
             ratio = min((i * step) / distance, 1.0)
@@ -194,15 +211,109 @@ class XsensLocalXY(Node):
 
         self.prev_x_m, self.prev_y_m = target_x_m, target_y_m
 
+    def wait_for_origin(self, timeout_sec: float = 5.0) -> bool:
+        start_time = self.get_clock().now().nanoseconds / 1e9
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.1)
+            if self.origin_set:
+                return True
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - start_time > timeout_sec:
+                return False
+        return False
+    
+    def process_xy_input(self, dx_m: float, dy_m: float, heading_deg: Optional[float] = None):
+        """
+        x,y is relative to the vehicle's current position.
+        """
+        if heading_deg is not None:
+            self.last_heading_deg = heading_deg
+
+        target_x_m = self.current_x_m + dx_m
+        target_y_m = self.current_y_m + dy_m
+
+        dummy_msg = SimpleNamespace()
+        dummy_msg.header = SimpleNamespace()
+        dummy_msg.header.stamp = self.get_clock().now().to_msg()
+
+        self.publish_points_between(dummy_msg, target_x_m, target_y_m)
+
+        self.get_logger().info(
+            f"CLI relative target -> dx={dx_m:.2f} m, dy={dy_m:.2f} m "
+            f"=> target x={target_x_m:.2f} m, y={target_y_m:.2f} m, "
+            f"heading={self.last_heading_deg:.2f}°"
+        )
+
+    def process_latlon_input(self, lat: float, lon: float, heading_deg: Optional[float] = None):
+        """
+        lat,lon is an absolute GPS target so convert to local XY
+        relative to current origin.
+        """
+        if isnan(lat) or isnan(lon):
+            self.get_logger().warn("Received NaN lat/lon from CLI... skipping...")
+            return
+
+        if heading_deg is not None:
+            self.last_heading_deg = heading_deg
+
+        if not self.origin_set:
+            raise ValueError("Cannot process lat/lon input before a valid GPS fix is received...")
+
+        target_x_m, target_y_m = self.latlon_to_local_xy(lat, lon)
+
+        dummy_msg = SimpleNamespace()
+        dummy_msg.header = SimpleNamespace()
+        dummy_msg.header.stamp = self.get_clock().now().to_msg()
+
+        self.publish_points_between(dummy_msg, target_x_m, target_y_m)
+
+        self.get_logger().info(
+            f"CLI lat/lon target -> lat={lat:.8f}, lon={lon:.8f} "
+            f"=> target x={target_x_m:.2f} m, y={target_y_m:.2f} m, "
+            f" {self.last_heading_deg:.2f}°"
+        )
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Accept one XY or one lat/lon target from the command line."
+    )
+
+    parser.add_argument("--xy", nargs=2, type=float, metavar=("X", "Y"),
+                        help="Relative XY target in meters from the vehicle's current position")
+    parser.add_argument("--latlon", nargs=2, type=float, metavar=("LAT", "LON"),
+                        help="Absolute latitude/longitude target")
+    parser.add_argument("--heading", type=float, default=None,
+                        help="Heading in degrees")
+
+    return parser.parse_args()
 
 def main(args=None):
+    cli = parse_args()
+
     rclpy.init(args=args)
     node = XsensLocalXY()
+    node.frame_id = "map"
 
     try:
+        if cli.xy is not None or cli.latlon is not None:
+            got_fix = node.wait_for_origin(timeout_sec=5.0)
+            if not got_fix:
+                raise RuntimeError("Timed out waiting for current GPS fix.")
+
+            if cli.xy is not None:
+                x, y = cli.xy
+                node.process_xy_input(x, y, cli.heading)
+                return
+
+            if cli.latlon is not None:
+                lat, lon = cli.latlon
+                node.process_latlon_input(lat, lon, cli.heading)
+                return
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        node.get_logger().error(str(e))
     finally:
         node.destroy_node()
         rclpy.shutdown()
