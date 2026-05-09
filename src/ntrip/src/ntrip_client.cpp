@@ -307,6 +307,42 @@ namespace ntrip_client
       is_connected_ = true;
       reconnect_attempts_ = 0;
 
+      // Reset chunked-decoding state for this connection.
+      is_chunked_ = false;
+      chunk_state_ = ChunkState::SIZE;
+      chunk_remaining_ = 0;
+      chunk_size_buf_.clear();
+
+      // Drain remaining HTTP headers until the blank line.
+      while (true)
+      {
+        boost::system::error_code hdr_err;
+        size_t hdr_bytes = boost::asio::read_until(socket_, response, "\r\n", hdr_err);
+        if (hdr_err || hdr_bytes == 0) break;
+        std::string hdr{boost::asio::buffers_begin(response.data()),
+                        boost::asio::buffers_begin(response.data()) + hdr_bytes};
+        response.consume(hdr_bytes);
+        // Detect chunked transfer encoding (case-insensitive).
+        std::string hdr_lower = hdr;
+        boost::algorithm::to_lower(hdr_lower);
+        if (hdr_lower.find("transfer-encoding: chunked") != std::string::npos)
+          is_chunked_ = true;
+        // Blank line marks end of headers.
+        if (hdr == "\r\n" || hdr == "\n") break;
+      }
+
+      if (is_chunked_)
+        RCLCPP_INFO(this->get_logger(), "Server is using chunked transfer encoding — decoding enabled");
+
+      // Forward any RTCM bytes already buffered after the headers.
+      if (response.size() > 0)
+      {
+        ProcessRawData(
+            boost::asio::buffer_cast<const uint8_t*>(response.data()),
+            response.size());
+        response.consume(response.size());
+      }
+
       ReadData();
       return true;
     }
@@ -339,7 +375,7 @@ namespace ntrip_client
       // Update bytes received
       bytes_received_ += bytes_transferred;
 
-      rtcm_parser_->ProcessData(
+      ProcessRawData(
           reinterpret_cast<const uint8_t *>(receive_buffer_.data()),
           bytes_transferred);
 
@@ -457,6 +493,62 @@ namespace ntrip_client
     diag_array->status.push_back(status);
 
     diagnostic_pub_->publish(std::move(diag_array));
+  }
+
+  void NtripClient::ProcessRawData(const uint8_t* data, size_t length)
+  {
+    if (!is_chunked_)
+    {
+      rtcm_parser_->ProcessData(data, length);
+      return;
+    }
+
+    // Strip HTTP/1.1 chunked transfer framing before passing to RTCM parser.
+    // Format per RFC 7230: <hex-size>[;ext]\r\n<data>\r\n  (repeat)
+    for (size_t i = 0; i < length; )
+    {
+      switch (chunk_state_)
+      {
+        case ChunkState::SIZE:
+        {
+          char c = static_cast<char>(data[i++]);
+          if (c == '\n')
+          {
+            // Strip optional chunk extension after ';'
+            auto semi = chunk_size_buf_.find(';');
+            std::string hex = (semi != std::string::npos)
+                ? chunk_size_buf_.substr(0, semi) : chunk_size_buf_;
+            hex.erase(hex.find_last_not_of(" \r\t") + 1);  // rtrim
+            if (!hex.empty())
+              chunk_remaining_ = std::stoul(hex, nullptr, 16);
+            chunk_size_buf_.clear();
+            chunk_state_ = (chunk_remaining_ > 0) ? ChunkState::DATA : ChunkState::SIZE;
+          }
+          else if (c != '\r')
+          {
+            chunk_size_buf_ += c;
+          }
+          break;
+        }
+        case ChunkState::DATA:
+        {
+          size_t avail = std::min(chunk_remaining_, length - i);
+          rtcm_parser_->ProcessData(data + i, avail);
+          i += avail;
+          chunk_remaining_ -= avail;
+          if (chunk_remaining_ == 0)
+            chunk_state_ = ChunkState::TRAIL;
+          break;
+        }
+        case ChunkState::TRAIL:
+        {
+          char c = static_cast<char>(data[i++]);
+          if (c == '\n')
+            chunk_state_ = ChunkState::SIZE;
+          break;
+        }
+      }
+    }
   }
 
   std::string NtripClient::CreateAuthHeader() const

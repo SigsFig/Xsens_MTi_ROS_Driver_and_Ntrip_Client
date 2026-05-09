@@ -55,6 +55,13 @@ namespace ntrip_client
         bool is_connected_;
         bool should_exit_;
 
+        // Chunked transfer decoding
+        bool is_chunked_{false};
+        enum class ChunkState { SIZE, DATA, TRAIL };
+        ChunkState chunk_state_{ChunkState::SIZE};
+        size_t chunk_remaining_{0};
+        std::string chunk_size_buf_;
+
 
         // Networking
         boost::asio::io_service io_service_;
@@ -101,6 +108,7 @@ namespace ntrip_client
         void HandleError(const std::string &error_msg, bool fatal = false);
         bool ValidateParameters() const;
         void DeclareParameters();
+        void ProcessRawData(const uint8_t* data, size_t length);
     };
 
 } // namespace ntrip_client

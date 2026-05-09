@@ -565,7 +565,7 @@ class XsensLocalXY(Node):
         return False
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Navigate to an XY or lat/lon goal using Dubins path + pure pursuit."
     )
@@ -587,13 +587,13 @@ def parse_args():
         help="Desired arrival heading in compass degrees (N=0, E=90, CW). "
              "Defaults to bearing toward goal if omitted.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main(args=None):
-    cli = parse_args()
-
+    import sys
     rclpy.init(args=args)
+    cli = parse_args(rclpy.utilities.remove_ros_args(sys.argv)[1:])
     node = XsensLocalXY()
 
     try:
