@@ -8,6 +8,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PointStamped, Vector3Stamped
 from std_msgs.msg import Float64
+from xsens_mti_ros2_driver.msg import XsStatusWord
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +257,12 @@ class XsensLocalXY(Node):
         self.goal_tolerance_m   = float(self.declare_parameter('goal_tolerance_m',   0.5).value)
         self.pursuit_hz         = float(self.declare_parameter('pursuit_hz',         10.0).value)
 
+        # RTK gating: only set origin once rtk_status >= this value.
+        # 0=none, 1=float, 2=fixed. Default 1 accepts float or fixed.
+        self.min_rtk_for_origin = int(self.declare_parameter('min_rtk_for_origin', 1).value)
+        self.rtk_status = 0
+        self._rtk_wait_logged = False
+
         # GPS / origin state
         self.origin_lat: Optional[float] = None
         self.origin_lon: Optional[float] = None
@@ -277,6 +284,7 @@ class XsensLocalXY(Node):
         self.heading_pub = self.create_publisher(Float64,       self.heading_topic, 10)
         self.create_subscription(Vector3Stamped, self.gps_topic,   self.gps_callback,   10)
         self.create_subscription(Vector3Stamped, self.euler_topic, self.euler_callback, 10)
+        self.create_subscription(XsStatusWord,   '/status',        self.status_callback, 10)
 
         self.get_logger().info(
             f"Subscribing GPS: {self.gps_topic}  euler: {self.euler_topic}"
@@ -296,6 +304,9 @@ class XsensLocalXY(Node):
         heading_msg.data = self.last_heading_deg
         self.heading_pub.publish(heading_msg)
 
+    def status_callback(self, msg: XsStatusWord):
+        self.rtk_status = msg.rtk_status
+
     def gps_callback(self, msg: Vector3Stamped):
         lat = float(msg.vector.x)
         lon = float(msg.vector.y)
@@ -305,12 +316,23 @@ class XsensLocalXY(Node):
             return
 
         if not self.origin_set:
+            if self.rtk_status < self.min_rtk_for_origin:
+                if not self._rtk_wait_logged:
+                    self.get_logger().info(
+                        f"Waiting for RTK before setting origin "
+                        f"(rtk_status={self.rtk_status}, need >={self.min_rtk_for_origin})"
+                    )
+                    self._rtk_wait_logged = True
+                return
             self.origin_lat = lat
             self.origin_lon = lon
             self.origin_set = True
             self.current_x_m = 0.0
             self.current_y_m = 0.0
-            self.get_logger().info(f"Origin set: lat={lat:.8f}, lon={lon:.8f}")
+            self.get_logger().info(
+                f"Origin set at rtk_status={self.rtk_status}: "
+                f"lat={lat:.8f}, lon={lon:.8f}"
+            )
             return
 
         self.current_x_m, self.current_y_m = self.latlon_to_local_xy(lat, lon)
