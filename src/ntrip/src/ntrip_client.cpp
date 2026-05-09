@@ -260,7 +260,7 @@ namespace ntrip_client
   bool NtripClient::SendHttpRequest()
   {
     std::stringstream request;
-    request << "GET /" << mountpoint_ << " HTTP/1.1\r\n"
+    request << "GET /" << mountpoint_ << " HTTP/1.0\r\n"
             << "Host: " << host_ << ":" << port_ << "\r\n"
             << "Ntrip-Version: Ntrip/2.0\r\n"
             << "User-Agent: NTRIP ROS2 Client/1.0\r\n";

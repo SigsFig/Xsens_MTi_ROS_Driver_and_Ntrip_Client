@@ -116,7 +116,7 @@
         # 8 = Airborne < 4g
         # 9 = Wrist
         # Applicable to: MTi-7/8/670(G)/680(G)/G-710 (GNSS/INS versions).
-        ublox_platform: 0 
+        ublox_platform: 4
 
         # u-blox GNSS Receiver Settings
         # -----------------------------
