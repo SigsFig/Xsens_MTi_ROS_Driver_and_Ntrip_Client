@@ -33,8 +33,12 @@ def generate_launch_description():
         description='NTRIP password'
     )
     heading_offset_arg = DeclareLaunchArgument(
-        'heading_offset_deg', default_value='30.0',
+        'heading_offset_deg', default_value='128.0',
         description='Compass heading offset in degrees to zero North'
+    )
+    min_rtk_arg = DeclareLaunchArgument(
+        'min_rtk_for_origin', default_value='2',
+        description='Minimum RTK status required before setting GPS origin (1=Float, 2=Fixed)'
     )
 
     # --------------------------------------------------------------------------
@@ -95,6 +99,7 @@ def generate_launch_description():
             subscriber_script,
             '--ros-args',
             '-p', ['heading_offset_deg:=', LaunchConfiguration('heading_offset_deg')],
+            '-p', ['min_rtk_for_origin:=', LaunchConfiguration('min_rtk_for_origin')],
         ],
         output='screen',
     )
@@ -110,6 +115,7 @@ def generate_launch_description():
         ntrip_username_arg,
         ntrip_password_arg,
         heading_offset_arg,
+        min_rtk_arg,
 
         # Nodes
         xsens_node,
