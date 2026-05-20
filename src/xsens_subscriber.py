@@ -9,6 +9,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import PointStamped, Vector3Stamped
 from std_msgs.msg import Float64
 from xsens_mti_ros2_driver.msg import XsStatusWord
+from ugv_msgs.msg import ManCtrl
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +258,18 @@ class XsensLocalXY(Node):
         self.goal_tolerance_m   = float(self.declare_parameter('goal_tolerance_m',   0.5).value)
         self.pursuit_hz         = float(self.declare_parameter('pursuit_hz',         10.0).value)
 
+        # Drive command output. ugv_control_sub maps:
+        #   steer_cmd in [-1, 1] -> 150..210 deg (so |1.0| = full lock, ~30 deg)
+        #   linear_vel in [-1, 1] -> abs(.) * speed_max_cmd (90) — sign is dropped MCU-side
+        # max_steering_deg: heading-error magnitude that saturates steering to full lock.
+        # max_velocity_mps: m/s value that maps to vel_norm = 1.0; tune to MCU calibration.
+        # steering_sign: flip to -1.0 if + heading error steers the wrong way after testing.
+        self.cmd_topic         = self.declare_parameter('cmd_topic',         'man_ctrl').value
+        self.max_steering_deg  = float(self.declare_parameter('max_steering_deg',  30.0).value)
+        self.max_velocity_mps  = float(self.declare_parameter('max_velocity_mps',  1.0).value)
+        self.steering_sign     = float(self.declare_parameter('steering_sign',     1.0).value)
+        self.arm_park_cmd      = list(self.declare_parameter('arm_park_cmd',  [0.0, 75.0]).value)
+
         # RTK gating: only set origin once rtk_status >= this value.
         # 0=none, 1=float, 2=fixed. Default 1 accepts float or fixed.
         self.min_rtk_for_origin = int(self.declare_parameter('min_rtk_for_origin', 1).value)
@@ -282,6 +295,7 @@ class XsensLocalXY(Node):
 
         self.xy_pub      = self.create_publisher(PointStamped, self.xy_topic,      10)
         self.heading_pub = self.create_publisher(Float64,       self.heading_topic, 10)
+        self.cmd_pub     = self.create_publisher(ManCtrl,       self.cmd_topic,    10)
         self.create_subscription(Vector3Stamped, self.gps_topic,   self.gps_callback,   10)
         self.create_subscription(Vector3Stamped, self.euler_topic, self.euler_callback, 10)
         self.create_subscription(XsStatusWord,   '/status',        self.status_callback, 10)
@@ -505,15 +519,37 @@ class XsensLocalXY(Node):
 
     def send_control(self, steering_angle_deg: float, velocity: float):
         """
-        PLACEHOLDER — replace with the actual vehicle interface.
+        Publish a ManCtrl message that ugv_control_sub will forward to the
+        drive MCU over UDP as "steer_deg,speed_cmd".
 
-        steering_angle_deg: desired turn angle in degrees.
-            Positive = left / CCW, negative = right / CW.
-        velocity: forward speed in m/s; 0.0 = stop.
+        steering_angle_deg: heading error in degrees (positive = left / CCW).
+            Saturated to +/- max_steering_deg, then normalized to [-1, 1].
+        velocity: forward speed in m/s; 0.0 = stop. Sign is dropped MCU-side.
         """
-        self.get_logger().info(
-            f"[CONTROL] steering={steering_angle_deg:+.2f}°  velocity={velocity:.3f} m/s"
+        steer_norm = self.steering_sign * max(
+            -1.0, min(1.0, steering_angle_deg / self.max_steering_deg)
         )
+        vel_norm = max(-1.0, min(1.0, velocity / self.max_velocity_mps))
+
+        msg = ManCtrl()
+        msg.auto_en = False
+        msg.linear_vel = float(vel_norm)
+        msg.steer_cmd = float(steer_norm)
+        msg.arm_cmd = [float(self.arm_park_cmd[0]), float(self.arm_park_cmd[1])]
+        self.cmd_pub.publish(msg)
+
+        self.get_logger().info(
+            f"[CONTROL] hdg_err={steering_angle_deg:+.2f}° -> steer={steer_norm:+.3f}, "
+            f"v={velocity:.3f} m/s -> vel={vel_norm:+.3f}"
+        )
+
+    def destroy_node(self):
+        # Best-effort stop before shutdown so the MCU doesn't keep the last drive command.
+        try:
+            self.send_control(0.0, 0.0)
+        except Exception:
+            pass
+        super().destroy_node()
 
     # -----------------------------------------------------------------------
     # CLI-initiated navigation
