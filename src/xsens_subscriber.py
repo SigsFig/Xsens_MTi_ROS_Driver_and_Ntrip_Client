@@ -255,8 +255,13 @@ class XsensLocalXY(Node):
         self.point_spacing_m    = float(self.declare_parameter('point_spacing_m',    0.1).value)
         self.lookahead_distance = float(self.declare_parameter('lookahead_distance', 1.5).value)
         self.linear_speed       = float(self.declare_parameter('linear_speed',       0.5).value)
-        self.goal_tolerance_m   = float(self.declare_parameter('goal_tolerance_m',   0.5).value)
+        # Wider tolerance is safer with Float RTK (~0.5m position drift) — prevents
+        # the controller from circling forever trying to reach a goal it's already at.
+        self.goal_tolerance_m   = float(self.declare_parameter('goal_tolerance_m',   1.5).value)
         self.pursuit_hz         = float(self.declare_parameter('pursuit_hz',         10.0).value)
+        # Safety watchdog: force-stop if navigation runs longer than this.
+        # Set generously based on expected goal distance / linear_speed.
+        self.max_runtime_sec    = float(self.declare_parameter('max_runtime_sec',    30.0).value)
 
         # Drive command output. ugv_control_sub maps:
         #   steer_cmd in [-1, 1] -> 150..210 deg (so |1.0| = full lock, ~30 deg)
@@ -426,6 +431,7 @@ class XsensLocalXY(Node):
 
         self.last_closest_index = 0
         self.is_navigating      = True
+        self.navigation_start_time = self.get_clock().now().nanoseconds / 1e9
 
         if self.pursuit_timer is not None:
             self.pursuit_timer.cancel()
@@ -439,6 +445,17 @@ class XsensLocalXY(Node):
 
     def _pursuit_tick(self):
         if not self.is_navigating or not self.dubins_path:
+            return
+
+        # Safety watchdog — guarantees the vehicle stops even if it can't reach goal.
+        elapsed = self.get_clock().now().nanoseconds / 1e9 - self.navigation_start_time
+        if elapsed > self.max_runtime_sec:
+            self.get_logger().error(
+                f"Runtime watchdog tripped at {elapsed:.1f}s (max={self.max_runtime_sec}s). Stopping."
+            )
+            self.send_control(0.0, 0.0)
+            self.is_navigating = False
+            self.pursuit_timer.cancel()
             return
 
         gx, gy = self.dubins_path[-1]
@@ -544,9 +561,15 @@ class XsensLocalXY(Node):
         )
 
     def destroy_node(self):
-        # Best-effort stop before shutdown so the MCU doesn't keep the last drive command.
+        # Best-effort stop before shutdown. Send multiple times with small delays
+        # so the MCU has several chances to receive the zero command before this
+        # process dies — the MCU has no watchdog and will otherwise keep the last
+        # non-zero command running indefinitely.
+        import time
         try:
-            self.send_control(0.0, 0.0)
+            for _ in range(10):
+                self.send_control(0.0, 0.0)
+                time.sleep(0.05)
         except Exception:
             pass
         super().destroy_node()
