@@ -263,16 +263,31 @@ class XsensLocalXY(Node):
         # Set generously based on expected goal distance / linear_speed.
         self.max_runtime_sec    = float(self.declare_parameter('max_runtime_sec',    30.0).value)
 
+        # Speed ramping (trapezoidal velocity profile). Off by default so existing
+        # tests behave identically. When enabled:
+        #   - first `accel_distance_m` of path: ramp from min_speed -> linear_speed
+        #   - middle: cruise at linear_speed
+        #   - last `decel_distance_m` before goal: ramp linear_speed -> min_speed
+        # min_speed should be just above the motor deadband so the vehicle keeps moving.
+        self.enable_speed_ramping = bool(self.declare_parameter('enable_speed_ramping', False).value)
+        self.accel_distance_m     = float(self.declare_parameter('accel_distance_m',    1.5).value)
+        self.decel_distance_m     = float(self.declare_parameter('decel_distance_m',    2.0).value)
+        self.min_speed            = float(self.declare_parameter('min_speed',           0.2).value)
+
         # Drive command output. ugv_control_sub maps:
         #   steer_cmd in [-1, 1] -> 150..210 deg (so |1.0| = full lock, ~30 deg)
         #   linear_vel in [-1, 1] -> abs(.) * speed_max_cmd (90) — sign is dropped MCU-side
-        # max_steering_deg: heading-error magnitude that saturates steering to full lock.
+        # max_steering_deg: vehicle's physical max front-wheel angle. Steering output
+        #   from the curvature-based controller is normalized against this for [-1,1].
         # max_velocity_mps: m/s value that maps to vel_norm = 1.0; tune to MCU calibration.
         # steering_sign: flip to -1.0 if + heading error steers the wrong way after testing.
+        # wheelbase_m: front-axle to rear-axle distance. Used by the Ackermann bicycle
+        #   model in pure pursuit to convert path curvature into a wheel angle.
         self.cmd_topic         = self.declare_parameter('cmd_topic',         'man_ctrl').value
         self.max_steering_deg  = float(self.declare_parameter('max_steering_deg',  30.0).value)
         self.max_velocity_mps  = float(self.declare_parameter('max_velocity_mps',  1.0).value)
         self.steering_sign     = float(self.declare_parameter('steering_sign',     1.0).value)
+        self.wheelbase_m       = float(self.declare_parameter('wheelbase_m',       0.6).value)
         self.arm_park_cmd      = list(self.declare_parameter('arm_park_cmd',  [0.0, 75.0]).value)
 
         # RTK gating: only set origin once rtk_status >= this value.
@@ -433,6 +448,17 @@ class XsensLocalXY(Node):
         self.is_navigating      = True
         self.navigation_start_time = self.get_clock().now().nanoseconds / 1e9
 
+        # Precompute cumulative arc length for speed ramping. path_arc_lengths[i]
+        # is the distance from path[0] to path[i] along the path.
+        self.path_arc_lengths = [0.0]
+        for i in range(1, len(self.dubins_path)):
+            x0, y0 = self.dubins_path[i - 1]
+            x1, y1 = self.dubins_path[i]
+            self.path_arc_lengths.append(
+                self.path_arc_lengths[-1] + math.hypot(x1 - x0, y1 - y0)
+            )
+        self.path_total_length = self.path_arc_lengths[-1]
+
         if self.pursuit_timer is not None:
             self.pursuit_timer.cancel()
         self.pursuit_timer = self.create_timer(
@@ -479,26 +505,74 @@ class XsensLocalXY(Node):
         )
         self.last_closest_index = closest_idx
 
-        # Convert compass heading to math degrees for angle arithmetic
+        # Heading error to lookahead point (alpha in pure pursuit literature).
+        # Positive alpha = need to turn CCW (left).
         vehicle_heading_math_deg = 90.0 - self.last_heading_deg
         target_angle_deg = math.degrees(
             math.atan2(lookahead[1] - self.current_y_m,
                        lookahead[0] - self.current_x_m)
         )
-        turn_angle_deg = target_angle_deg - vehicle_heading_math_deg
-        if turn_angle_deg > 180.0:
-            turn_angle_deg -= 360.0
-        elif turn_angle_deg < -180.0:
-            turn_angle_deg += 360.0
+        alpha_deg = target_angle_deg - vehicle_heading_math_deg
+        if alpha_deg > 180.0:
+            alpha_deg -= 360.0
+        elif alpha_deg < -180.0:
+            alpha_deg += 360.0
 
-        self.send_control(turn_angle_deg, self.linear_speed)
+        # Curvature-based pure pursuit (Ackermann bicycle model).
+        # Path curvature to the lookahead point: kappa = 2*sin(alpha) / L_d.
+        # Steering angle from kappa: delta = atan(wheelbase * kappa).
+        # This scales steering with lookahead distance — a large alpha at far
+        # lookahead produces a gentle curve, while close lookahead with the same
+        # alpha produces a sharp turn. Replaces the previous naive
+        # "send raw heading error as steering" which always saturated.
+        alpha_rad = math.radians(alpha_deg)
+        lookahead_dist_actual = math.hypot(
+            lookahead[0] - self.current_x_m, lookahead[1] - self.current_y_m
+        )
+        if lookahead_dist_actual < 1e-3:
+            curvature = 0.0
+        else:
+            curvature = 2.0 * math.sin(alpha_rad) / lookahead_dist_actual
+        steer_deg = math.degrees(math.atan(self.wheelbase_m * curvature))
+
+        # Compute the speed for this tick.
+        speed = self._compute_ramped_speed(closest_idx, dist_to_goal)
+
+        self.send_control(steer_deg, speed)
 
         if self.log_every_fix:
             self.get_logger().info(
                 f"Pursuit: pos=({self.current_x_m:.2f},{self.current_y_m:.2f}) "
                 f"lookahead=({lookahead[0]:.2f},{lookahead[1]:.2f}) "
-                f"hdg={self.last_heading_deg:.1f}° steer={turn_angle_deg:+.2f}°"
+                f"hdg={self.last_heading_deg:.1f}° alpha={alpha_deg:+.2f}° "
+                f"steer={steer_deg:+.2f}° v={speed:.2f}"
             )
+
+    def _compute_ramped_speed(self, closest_idx: int, dist_to_goal: float) -> float:
+        """
+        Trapezoidal speed profile based on position along the path.
+        Returns linear_speed when ramping is disabled or path is too short.
+        """
+        if not self.enable_speed_ramping:
+            return self.linear_speed
+
+        # Path too short to fit accel + decel — just cruise at linear_speed.
+        if self.path_total_length < (self.accel_distance_m + self.decel_distance_m):
+            return self.linear_speed
+
+        dist_traveled = self.path_arc_lengths[closest_idx]
+        # Use straight-line distance to goal for the decel zone — this matches the
+        # goal-tolerance check and handles cases where the vehicle is off-path.
+
+        if dist_traveled < self.accel_distance_m:
+            frac = dist_traveled / self.accel_distance_m
+            return self.min_speed + frac * (self.linear_speed - self.min_speed)
+
+        if dist_to_goal < self.decel_distance_m:
+            frac = dist_to_goal / self.decel_distance_m
+            return self.min_speed + frac * (self.linear_speed - self.min_speed)
+
+        return self.linear_speed
 
     def _find_lookahead_point(
         self,
@@ -539,8 +613,10 @@ class XsensLocalXY(Node):
         Publish a ManCtrl message that ugv_control_sub will forward to the
         drive MCU over UDP as "steer_deg,speed_cmd".
 
-        steering_angle_deg: heading error in degrees (positive = left / CCW).
-            Saturated to +/- max_steering_deg, then normalized to [-1, 1].
+        steering_angle_deg: desired front-wheel angle in degrees (Ackermann
+            bicycle model output from pure pursuit). Positive = left / CCW.
+            Normalized against max_steering_deg (vehicle's physical max angle)
+            to produce a [-1, 1] command.
         velocity: forward speed in m/s; 0.0 = stop. Sign is dropped MCU-side.
         """
         steer_norm = self.steering_sign * max(
