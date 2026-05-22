@@ -265,12 +265,15 @@ class XsensLocalXY(Node):
 
         # Speed ramping (trapezoidal velocity profile). Off by default so existing
         # tests behave identically. When enabled:
-        #   - first `accel_distance_m` of path: ramp from min_speed -> linear_speed
-        #   - middle: cruise at linear_speed
-        #   - last `decel_distance_m` before goal: ramp linear_speed -> min_speed
+        #   - accel phase: ramp from min_speed -> linear_speed over either
+        #       accel_time_sec (if > 0) or accel_distance_m (fallback).
+        #   - cruise: hold linear_speed
+        #   - decel phase: ramp linear_speed -> min_speed over the last
+        #       decel_distance_m before the goal.
         # min_speed should be just above the motor deadband so the vehicle keeps moving.
         self.enable_speed_ramping = bool(self.declare_parameter('enable_speed_ramping', False).value)
         self.accel_distance_m     = float(self.declare_parameter('accel_distance_m',    1.5).value)
+        self.accel_time_sec       = float(self.declare_parameter('accel_time_sec',      0.0).value)
         self.decel_distance_m     = float(self.declare_parameter('decel_distance_m',    2.0).value)
         self.min_speed            = float(self.declare_parameter('min_speed',           0.2).value)
 
@@ -550,27 +553,29 @@ class XsensLocalXY(Node):
 
     def _compute_ramped_speed(self, closest_idx: int, dist_to_goal: float) -> float:
         """
-        Trapezoidal speed profile based on position along the path.
-        Returns linear_speed when ramping is disabled or path is too short.
+        Trapezoidal speed profile. Accel phase is time- or distance-based; decel
+        phase is always distance-from-goal based.
+        Returns linear_speed when ramping is disabled.
         """
         if not self.enable_speed_ramping:
             return self.linear_speed
 
-        # Path too short to fit accel + decel — just cruise at linear_speed.
-        if self.path_total_length < (self.accel_distance_m + self.decel_distance_m):
-            return self.linear_speed
-
-        dist_traveled = self.path_arc_lengths[closest_idx]
-        # Use straight-line distance to goal for the decel zone — this matches the
-        # goal-tolerance check and handles cases where the vehicle is off-path.
-
-        if dist_traveled < self.accel_distance_m:
-            frac = dist_traveled / self.accel_distance_m
-            return self.min_speed + frac * (self.linear_speed - self.min_speed)
-
+        # Decel zone — slow down as we approach goal.
         if dist_to_goal < self.decel_distance_m:
             frac = dist_to_goal / self.decel_distance_m
             return self.min_speed + frac * (self.linear_speed - self.min_speed)
+
+        # Accel zone — either time-based or distance-based.
+        if self.accel_time_sec > 0.0:
+            elapsed = self.get_clock().now().nanoseconds / 1e9 - self.navigation_start_time
+            if elapsed < self.accel_time_sec:
+                frac = elapsed / self.accel_time_sec
+                return self.min_speed + frac * (self.linear_speed - self.min_speed)
+        else:
+            dist_traveled = self.path_arc_lengths[closest_idx]
+            if dist_traveled < self.accel_distance_m:
+                frac = dist_traveled / self.accel_distance_m
+                return self.min_speed + frac * (self.linear_speed - self.min_speed)
 
         return self.linear_speed
 
