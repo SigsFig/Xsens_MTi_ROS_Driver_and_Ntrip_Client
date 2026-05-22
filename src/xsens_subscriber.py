@@ -277,6 +277,15 @@ class XsensLocalXY(Node):
         self.decel_distance_m     = float(self.declare_parameter('decel_distance_m',    2.0).value)
         self.min_speed            = float(self.declare_parameter('min_speed',           0.2).value)
 
+        # Controller selection:
+        #   False (default) — original heading-error-as-steering. Aggressive,
+        #     saturates to full lock at >max_steering_deg error. Better at
+        #     following tight Dubins curves (e.g., U-turn loops for backward goals).
+        #   True — curvature-based pure pursuit (Ackermann bicycle model).
+        #     Smoother on straight paths, but may under-steer on tight curves
+        #     unless lookahead_distance is short.
+        self.use_curvature_pursuit = bool(self.declare_parameter('use_curvature_pursuit', False).value)
+
         # Drive command output. ugv_control_sub maps:
         #   steer_cmd in [-1, 1] -> 150..210 deg (so |1.0| = full lock, ~30 deg)
         #   linear_vel in [-1, 1] -> abs(.) * speed_max_cmd (90) — sign is dropped MCU-side
@@ -521,22 +530,24 @@ class XsensLocalXY(Node):
         elif alpha_deg < -180.0:
             alpha_deg += 360.0
 
-        # Curvature-based pure pursuit (Ackermann bicycle model).
-        # Path curvature to the lookahead point: kappa = 2*sin(alpha) / L_d.
-        # Steering angle from kappa: delta = atan(wheelbase * kappa).
-        # This scales steering with lookahead distance — a large alpha at far
-        # lookahead produces a gentle curve, while close lookahead with the same
-        # alpha produces a sharp turn. Replaces the previous naive
-        # "send raw heading error as steering" which always saturated.
-        alpha_rad = math.radians(alpha_deg)
-        lookahead_dist_actual = math.hypot(
-            lookahead[0] - self.current_x_m, lookahead[1] - self.current_y_m
-        )
-        if lookahead_dist_actual < 1e-3:
-            curvature = 0.0
+        # Steering controller selection. See use_curvature_pursuit comment in __init__.
+        if self.use_curvature_pursuit:
+            # Curvature-based pure pursuit (Ackermann bicycle model).
+            # kappa = 2*sin(alpha) / L_d ; delta = atan(wheelbase * kappa).
+            alpha_rad = math.radians(alpha_deg)
+            lookahead_dist_actual = math.hypot(
+                lookahead[0] - self.current_x_m, lookahead[1] - self.current_y_m
+            )
+            if lookahead_dist_actual < 1e-3:
+                curvature = 0.0
+            else:
+                curvature = 2.0 * math.sin(alpha_rad) / lookahead_dist_actual
+            steer_deg = math.degrees(math.atan(self.wheelbase_m * curvature))
         else:
-            curvature = 2.0 * math.sin(alpha_rad) / lookahead_dist_actual
-        steer_deg = math.degrees(math.atan(self.wheelbase_m * curvature))
+            # Original method: heading error sent directly as steering, saturates
+            # to full lock at +/- max_steering_deg. Aggressive on curves, works
+            # well for tight Dubins paths including backward U-turn loops.
+            steer_deg = alpha_deg
 
         # Compute the speed for this tick.
         speed = self._compute_ramped_speed(closest_idx, dist_to_goal)
