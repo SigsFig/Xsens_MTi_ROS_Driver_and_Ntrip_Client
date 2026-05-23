@@ -251,9 +251,9 @@ class XsensLocalXY(Node):
         self.heading_offset_deg = float(self.declare_parameter('heading_offset_deg', 30.0).value)
 
         # Dubins / pure pursuit parameters
-        self.min_turn_radius    = float(self.declare_parameter('min_turn_radius',    2.0).value)
+        self.min_turn_radius    = float(self.declare_parameter('min_turn_radius',    3.0).value)
         self.point_spacing_m    = float(self.declare_parameter('point_spacing_m',    0.1).value)
-        self.lookahead_distance = float(self.declare_parameter('lookahead_distance', 1.5).value)
+        self.lookahead_distance = float(self.declare_parameter('lookahead_distance', 2.0).value)
         self.linear_speed       = float(self.declare_parameter('linear_speed',       0.5).value)
         # Wider tolerance is safer with Float RTK (~0.5m position drift) — prevents
         # the controller from circling forever trying to reach a goal it's already at.
@@ -300,7 +300,7 @@ class XsensLocalXY(Node):
         self.max_velocity_mps  = float(self.declare_parameter('max_velocity_mps',  1.0).value)
         self.steering_sign     = float(self.declare_parameter('steering_sign',     1.0).value)
         self.wheelbase_m       = float(self.declare_parameter('wheelbase_m',       0.6).value)
-        self.arm_park_cmd      = list(self.declare_parameter('arm_park_cmd',  [0.0, 75.0]).value)
+        self.arm_park_cmd      = list(self.declare_parameter('arm_park_cmd',  [0.0, 0.0]).value)
 
         # RTK gating: only set origin once rtk_status >= this value.
         # 0=none, 1=float, 2=fixed. Default 1 accepts float or fixed.
@@ -325,12 +325,21 @@ class XsensLocalXY(Node):
         self.is_navigating      = False
         self.pursuit_timer      = None
 
+        # Arm passthrough: we don't want to control the arm — but ManCtrl
+        # requires an arm_cmd field, and ugv_control_sub forwards every value
+        # to the arm MCU. To avoid moving the arm we mirror whatever arm_cmd
+        # was last seen on /man_ctrl (e.g. from the joystick), filtering out
+        # our own publishes by comparison.
+        self._tracked_arm_cmd        = list(self.arm_park_cmd)
+        self._last_published_arm_cmd = None
+
         self.xy_pub      = self.create_publisher(PointStamped, self.xy_topic,      10)
         self.heading_pub = self.create_publisher(Float64,       self.heading_topic, 10)
         self.cmd_pub     = self.create_publisher(ManCtrl,       self.cmd_topic,    10)
         self.create_subscription(Vector3Stamped, self.gps_topic,   self.gps_callback,   10)
         self.create_subscription(Vector3Stamped, self.euler_topic, self.euler_callback, 10)
         self.create_subscription(XsStatusWord,   '/status',        self.status_callback, 10)
+        self.create_subscription(ManCtrl,        self.cmd_topic,   self._man_ctrl_callback, 10)
 
         self.get_logger().info(
             f"Subscribing GPS: {self.gps_topic}  euler: {self.euler_topic}"
@@ -352,6 +361,22 @@ class XsensLocalXY(Node):
 
     def status_callback(self, msg: XsStatusWord):
         self.rtk_status = msg.rtk_status
+
+    def _man_ctrl_callback(self, msg: ManCtrl):
+        """Track arm_cmd from external publishers (joystick teleop, manual pubs).
+
+        Our own publishes echo to this subscription too; we identify them by
+        comparing against the last arm_cmd we published and skip those, so
+        only external updates change the tracked value.
+        """
+        incoming = [round(float(msg.arm_cmd[0]), 3),
+                    round(float(msg.arm_cmd[1]), 3)]
+        if self._last_published_arm_cmd is not None:
+            published = [round(self._last_published_arm_cmd[0], 3),
+                         round(self._last_published_arm_cmd[1], 3)]
+            if incoming == published:
+                return
+        self._tracked_arm_cmd = incoming
 
     def gps_callback(self, msg: Vector3Stamped):
         lat = float(msg.vector.x)
@@ -641,11 +666,17 @@ class XsensLocalXY(Node):
         )
         vel_norm = max(-1.0, min(1.0, velocity / self.max_velocity_mps))
 
+        # Use the tracked arm_cmd (last seen from an external publisher) so we
+        # don't move the arm. Falls back to arm_park_cmd if nothing external
+        # has been observed yet — that first publish will move the arm.
+        arm_cmd = [float(self._tracked_arm_cmd[0]), float(self._tracked_arm_cmd[1])]
+
         msg = ManCtrl()
         msg.auto_en = False
         msg.linear_vel = float(vel_norm)
         msg.steer_cmd = float(steer_norm)
-        msg.arm_cmd = [float(self.arm_park_cmd[0]), float(self.arm_park_cmd[1])]
+        msg.arm_cmd = arm_cmd
+        self._last_published_arm_cmd = list(arm_cmd)
         self.cmd_pub.publish(msg)
 
         self.get_logger().info(
