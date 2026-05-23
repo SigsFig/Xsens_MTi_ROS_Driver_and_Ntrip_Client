@@ -559,7 +559,8 @@ class XsensLocalXY(Node):
                 f"Pursuit: pos=({self.current_x_m:.2f},{self.current_y_m:.2f}) "
                 f"lookahead=({lookahead[0]:.2f},{lookahead[1]:.2f}) "
                 f"hdg={self.last_heading_deg:.1f}° alpha={alpha_deg:+.2f}° "
-                f"steer={steer_deg:+.2f}° v={speed:.2f}"
+                f"steer={steer_deg:+.2f}° v={speed:.2f} "
+                f"dist_to_goal={dist_to_goal:.2f}m"
             )
 
     def _compute_ramped_speed(self, closest_idx: int, dist_to_goal: float) -> float:
